@@ -1,0 +1,17 @@
+# Ocultar credenciales y tokens en cualquier carpeta o subcarpeta
+**/credentials.json
+**/token.json
+credentials.json
+token.json
+
+# Entornos virtuales
+venv/
+env/
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+
+# Archivos de sistema de Windows
+Thumbs.db
+desktop.ini
