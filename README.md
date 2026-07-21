@@ -30,18 +30,18 @@
 
 ### **2\. Clonar e Instalar Dependencias**
 
-`# 1. Clona el repositorio`  
+#### 1. Clona el repositorio
 `git clone https://github.com/duexian/csv-to-sheets-monitor.git`  
 `cd csv-to-sheets-monitor`
 
-`# 2. (Opcional) Crea y activa un entorno virtual`  
+#### 2. (Opcional) Crea y activa un entorno virtual
 `python -m venv venv`  
-`# En Windows:`  
+##### En Windows:
 `venv\Scripts\activate`  
-`# En Mac/Linux:`  
+##### En Mac/Linux:
 `source venv/bin/activate`
 
-`# 3. Instala los paquetes requeridos`  
+#### 3. Instala los paquetes requeridos
 `pip install -r requirements.txt`
 
 ## **⚙️ Configuración**
@@ -59,17 +59,17 @@
 ### **2\. Archivo de Reglas (rules.yaml)**
 
 Define las reglas según el prefijo del nombre de los archivos CSV que descargas. Edita el archivo rules.yaml:  
-`# Si el archivo empieza con "Enrolled" (ej: Enrolled_2026.csv)`  
+#### Si el archivo empieza con "Enrolled" (ej: Enrolled_2026.csv)
 `Enrolled:`  
-  `spreadsheet_id: "TU_GOOGLE_SHEET_ID_AQUÍ"`  
-  `nombre_hoja: "Enrolled"`  
-  `poner_nota_a1: true`
+`  spreadsheet_id: "TU_GOOGLE_SHEET_ID_AQUÍ"`  
+`  nombre_hoja: "Enrolled"`  
+`  poner_nota_a1: true`
 
-`# Si el archivo empieza con "Participantes" (ej: Participantes_Reporte.csv)`  
+#### Si el archivo empieza con "Participantes" (ej: Participantes_Reporte.csv)
 `Participantes:`  
-  `spreadsheet_id: "TU_OTRO_GOOGLE_SHEET_ID_AQUÍ"`  
-  `nombre_hoja: "Participantes"`  
-  `poner_nota_a1: true`
+`  spreadsheet_id: "TU_OTRO_GOOGLE_SHEET_ID_AQUÍ"`  
+`  nombre_hoja: "Participantes"`  
+`  poner_nota_a1: true`
 
 ## **🚀 Uso**
 
