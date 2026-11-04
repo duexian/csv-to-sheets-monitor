@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import dataclasses
+import hashlib
 import io
 import json
 import logging
@@ -27,13 +29,14 @@ import os
 import queue
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
@@ -106,7 +109,13 @@ def setup_logging(log_file: Optional[Path] = LOG_FILE, level: int = logging.INFO
     if stream is not None:
         console = logging.StreamHandler(stream)
         console.setFormatter(formatter)
+        console.addFilter(lambda record: not getattr(record, "solo_archivo", False))
         logger.addHandler(console)
+
+
+def log_details(err: BaseException, level: int = logging.INFO) -> None:
+    """Traceback completo solo en el archivo de registro (la consola queda limpia)."""
+    logger.log(level, "Detalle técnico:\n%s", format_error_details(err), extra={"solo_archivo": True})
 
 
 # ==============================================================================
@@ -131,10 +140,42 @@ class ErrorInfo:
     transitorio: bool = False
 
 
+def _error_chain(err: BaseException):
+    seen = set()
+    current: Optional[BaseException] = err
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def is_network_block(err: BaseException) -> bool:
+    """True si la red interceptó la conexión a Google.
+
+    El filtro del firewall (Fortinet / FortiGuard Secure DNS) responde a ratos con
+    su "página de bloqueo" para oauth2.googleapis.com (el servicio que renueva la
+    sesión cada hora), con un certificado autofirmado → CERTIFICATE_VERIFY_FAILED.
+    Nunca se desactiva la verificación SSL: se reintenta hasta que la red deja pasar.
+    """
+    for e in _error_chain(err):
+        if isinstance(e, ssl.SSLCertVerificationError):
+            return True
+        text = str(e)
+        if "CERTIFICATE_VERIFY_FAILED" in text or "Fortiguard" in text or "Hostname mismatch" in text:
+            return True
+    return False
+
+
 def describe_error(err: BaseException) -> ErrorInfo:
     """Traduce una excepción a un mensaje breve y accionable para el usuario."""
     detalle = str(err).strip() or type(err).__name__
 
+    if is_network_block(err):
+        return ErrorInfo(
+            "Red bloqueó la conexión a Google",
+            "El firewall de la red (Fortinet) interceptó la conexión. Se reintentará automáticamente.",
+            True,
+        )
     if isinstance(err, HttpError):
         status = getattr(err.resp, "status", None)
         try:
@@ -355,9 +396,20 @@ class AppConfig:
     segundos_espera_maxima: float = 120.0
     # Ignora eventos repetidos del mismo archivo (mismo tamaño y fecha) en esta ventana.
     segundos_ventana_duplicados: float = 60.0
-    # Reintentos ante errores temporales (internet, archivo bloqueado, 5xx de Google).
+    # Reintentos de cada petición HTTP ante 5xx/429 (los gestiona la librería de Google).
     reintentos: int = 3
+    # Esperas entre reintentos inmediatos ante errores temporales (red bloqueada,
+    # sin internet, archivo en uso). Si se agotan, el archivo pasa a "pendientes".
+    esperas_reintento: Tuple[float, ...] = (10.0, 30.0, 60.0)
+    minutos_reintento_pendientes: float = 3.0
+    horas_max_pendiente: float = 24.0
+    # Renovar la sesión cuando falten menos de estos minutos para que caduque.
+    minutos_margen_token: float = 15.0
     filas_por_lote: int = 5000
+
+    @property
+    def ruta_pendientes(self) -> Path:
+        return self.script_dir / "logs" / "pendientes.json"
 
     @property
     def ruta_rules(self) -> Path:
@@ -707,6 +759,7 @@ class GoogleSheetsService:
         self.on_login_required = on_login_required
         self.service_builder = service_builder
         self._service: Any = None
+        self._creds: Optional[Credentials] = None
         self._lock = threading.RLock()
 
     # ---------------------------- autenticación -----------------------------
@@ -772,13 +825,40 @@ class GoogleSheetsService:
     def get_service(self) -> Any:
         with self._lock:
             if self._service is None:
-                creds = self._load_credentials()
-                self._service = self.service_builder("sheets", "v4", credentials=creds, cache_discovery=False)
+                self._creds = self._load_credentials()
+                self._service = self.service_builder("sheets", "v4", credentials=self._creds, cache_discovery=False)
             return self._service
 
     def reset(self) -> None:
         with self._lock:
             self._service = None
+            self._creds = None
+
+    def refresh_if_needed(self) -> bool:
+        """Renueva la sesión por adelantado (se llama cada minuto en segundo plano).
+
+        El acceso de Google dura 1 hora. Renovarlo antes de que caduque, en cuanto la
+        red lo permita, evita depender de oauth2.googleapis.com (que el firewall
+        bloquea a ratos) justo cuando llega un CSV. Devuelve True si queda vigente.
+        """
+        with self._lock:
+            creds = self._creds
+            if creds is None:
+                return False
+            expiry = getattr(creds, "expiry", None)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)  # google-auth usa UTC sin tz
+            if creds.valid and expiry is not None and expiry - now > timedelta(minutes=self.config.minutos_margen_token):
+                return True
+            try:
+                creds.refresh(Request())
+                self._save_token(creds)
+                logger.debug("🔑 Sesión de Google renovada por adelantado.")
+                return True
+            except RefreshError:
+                raise
+            except Exception as err:
+                logger.debug("Renovación anticipada falló (%s); se reintentará.", describe_error(err).titulo)
+                return False
 
     # ------------------------------ utilidades ------------------------------
     def _execute(self, request: Any) -> Any:
@@ -920,6 +1000,95 @@ class SyncStatus:
                 logger.debug("Listener de estado falló", exc_info=True)
 
 
+class PendingStore:
+    """CSV que no se pudieron subir por un problema temporal (logs/pendientes.json).
+
+    Se guarda UN archivo por regla (el más reciente): cada CSV reemplaza la hoja
+    completa, así que reintentar uno viejo después de uno nuevo pisaría datos
+    actuales. Cada operación relee el archivo, para compartirlo entre procesos
+    (monitor y --archivo).
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as err:
+            logger.warning("No se pudo leer %s (%s); se empieza vacío.", self.path.name, err)
+            return {}
+
+    def _save(self, items: Dict[str, Dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def set(self, prefijo: str, path: Path, motivo: str) -> bool:
+        """Registra el archivo de la regla. True si es nuevo (o reemplaza a otro)."""
+        with self._lock:
+            items = self._load()
+            prev = items.get(prefijo)
+            nuevo = prev is None or prev.get("archivo") != str(path)
+            if nuevo:
+                if prev:
+                    logger.info("♻️ '%s' reemplaza a '%s' en pendientes (es más reciente).",
+                                path.name, Path(prev["archivo"]).name)
+                prev = {"archivo": str(path), "desde": datetime.now().isoformat(timespec="seconds"), "intentos": 0}
+            prev["intentos"] = int(prev.get("intentos", 0)) + 1
+            prev["motivo"] = motivo
+            prev["ultimo_intento"] = datetime.now().isoformat(timespec="seconds")
+            items[prefijo] = prev
+            self._save(items)
+            return nuevo
+
+    def get(self, prefijo: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._load().get(prefijo)
+
+    def remove(self, prefijo: str, only_if: Optional[Path] = None) -> bool:
+        with self._lock:
+            items = self._load()
+            entry = items.get(prefijo)
+            if entry is None or (only_if is not None and entry.get("archivo") != str(only_if)):
+                return False
+            del items[prefijo]
+            self._save(items)
+            return True
+
+    def resolve_after_success(self, prefijo: str, synced: Path) -> bool:
+        """Tras subir `synced`, quita el pendiente de la regla si es ese mismo archivo
+        o uno más antiguo (ya no tiene sentido subirlo). Devuelve True si quitó algo."""
+        with self._lock:
+            items = self._load()
+            entry = items.get(prefijo)
+            if entry is None:
+                return False
+            pending_path = Path(entry["archivo"])
+            if pending_path != synced:
+                try:
+                    if pending_path.exists() and pending_path.stat().st_mtime > synced.stat().st_mtime:
+                        return False  # el pendiente es más nuevo: se conserva
+                except OSError:
+                    pass
+            del items[prefijo]
+            self._save(items)
+            return True
+
+    def items(self) -> List[Tuple[str, Dict[str, Any]]]:
+        with self._lock:
+            return list(self._load().items())
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._load())
+
+
 class FileProcessor:
     """Espera a que la descarga termine, sube el CSV y notifica el resultado."""
 
@@ -932,15 +1101,20 @@ class FileProcessor:
         status: Optional[SyncStatus] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        pending: Optional[PendingStore] = None,
     ):
         self.config = config
         self.rules = rules
         self.sheets = sheets
         self.notifier = notifier
+        self.pending = pending or PendingStore(config.ruta_pendientes)
         self.status = status or SyncStatus()
         self.sleep = sleep
         self.clock = clock
-        self._recent: Dict[Tuple[str, int, int], float] = {}
+        # Hora (reloj de pared) en que arrancó el monitor: los archivos que ya
+        # estaban en Descargas antes de esta hora NUNCA se suben automáticamente.
+        self.started_at = time.time()
+        self._seen: Dict[str, Tuple[int, str]] = {}  # ruta -> (tamaño, sha1) ya procesados
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ filtro
@@ -950,6 +1124,49 @@ class FileProcessor:
         if path.suffix.lower() != self.config.extension_requerida.lower():
             return None
         return self.rules.match(path.name)
+
+    MARGEN_ARRANQUE_SEG = 10.0
+
+    def is_new_download(self, path: Path) -> bool:
+        """True solo si el contenido del archivo cambió desde que arrancó el monitor.
+
+        Windows (antivirus, indexador, vista previa del Explorador) lee los archivos
+        de Descargas y eso dispara eventos de "modificado" aunque el contenido no
+        cambie. Un CSV viejo NUNCA debe volver a subirse por eso: se exige que su
+        fecha de modificación sea posterior al arranque del monitor.
+        """
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return False
+        return mtime >= self.started_at - self.MARGEN_ARRANQUE_SEG
+
+    def newer_file_for_rule(self, path: Path, rule: FileRule) -> Optional[Path]:
+        """Otro CSV de la misma regla más reciente en la carpeta (si existe)."""
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return None
+        newest: Optional[Tuple[int, Path]] = None
+        try:
+            candidates = list(path.parent.iterdir())
+        except OSError:
+            return None
+        for other in candidates:
+            if other == path or other.suffix.lower() != self.config.extension_requerida.lower():
+                continue
+            if not other.name.lower().startswith(rule.prefijo.lower()):
+                continue
+            other_rule = self.match(other)
+            if other_rule is None or other_rule.prefijo != rule.prefijo:
+                continue  # pertenece a una regla más específica
+            try:
+                other_mtime = other.stat().st_mtime_ns
+            except OSError:
+                continue
+            if other_mtime > mtime and (newest is None or other_mtime > newest[0]):
+                newest = (other_mtime, other)
+        return newest[1] if newest else None
 
     # ----------------------------------------------------- espera de descarga
     def wait_until_ready(self, path: Path) -> bool:
@@ -982,22 +1199,26 @@ class FileProcessor:
         return False
 
     def _is_duplicate(self, path: Path) -> bool:
+        """True si ya se procesó este archivo con exactamente el mismo contenido.
+
+        Se compara una huella (SHA-1) del contenido, no la fecha: así ninguna
+        lectura o cambio de atributos de Windows provoca otra subida, sin ventana
+        de tiempo. Si el contenido cambia de verdad, se procesa de nuevo.
+        """
         try:
-            st = path.stat()
+            data = path.read_bytes()
         except OSError:
             return False
-        key = (str(path).lower(), st.st_size, st.st_mtime_ns)
-        now = self.clock()
+        key, sig = str(path).lower(), (len(data), hashlib.sha1(data).hexdigest())
         with self._lock:
-            self._recent = {k: t for k, t in self._recent.items()
-                            if now - t < self.config.segundos_ventana_duplicados}
-            if key in self._recent:
+            if self._seen.get(key) == sig:
                 return True
-            self._recent[key] = now
+            self._seen[key] = sig
             return False
 
     # -------------------------------------------------------------- proceso
-    def process(self, path: Path, force: bool = False, dry_run: bool = False) -> Optional[SyncResult]:
+    def process(self, path: Path, force: bool = False, dry_run: bool = False,
+                from_pending: bool = False) -> Optional[SyncResult]:
         """Procesa el archivo. Nunca lanza excepciones (las notifica y registra)."""
         try:
             rule = self.match(path)
@@ -1009,25 +1230,48 @@ class FileProcessor:
         if self.status.pausado and not force:
             logger.info("⏸️ Monitoreo en pausa: se ignora %s", path.name)
             return None
+        if from_pending:
+            entry = self.pending.get(rule.prefijo)
+            if entry is None or entry.get("archivo") != str(path):
+                logger.debug("%s ya no es el pendiente de '%s'; se omite.", path.name, rule.prefijo)
+                return None
+
+        if not force and not self.is_new_download(path):
+            logger.debug("Ignorado (ya existía antes de arrancar el monitor): %s", path.name)
+            return None
 
         if not self.wait_until_ready(path):
+            if from_pending and not path.exists():
+                self.pending.remove(rule.prefijo, only_if=path)
+                logger.info("🗑️ %s ya no existe; se quita de pendientes.", path.name)
             return None
         if not force and self._is_duplicate(path):
             logger.debug("Evento duplicado ignorado: %s", path.name)
             return None
+        if not force or from_pending:
+            # Cada CSV reemplaza la hoja entera: nunca subir uno más antiguo que otro
+            # de la misma regla que ya está en la carpeta.
+            newer = self.newer_file_for_rule(path, rule)
+            if newer is not None:
+                logger.info("⏭️ Se omite %s: hay uno más reciente de '%s' (%s).", path.name, rule.prefijo, newer.name)
+                if from_pending:
+                    self.pending.remove(rule.prefijo, only_if=path)
+                return None
 
-        logger.info("📄 Archivo detectado: %s → regla '%s' (pestaña '%s')", path.name, rule.prefijo, rule.nombre_hoja)
+        logger.info("📄 %s: %s → regla '%s' (pestaña '%s')", "Reintentando pendiente" if from_pending else "Archivo detectado",
+                    path.name, rule.prefijo, rule.nombre_hoja)
         self.status.procesando = path.name
         self.status.ultimo_archivo, self.status.ultima_regla = path, rule
         self.status.changed()
         try:
-            result = self._sync_with_retries(path, rule, dry_run)
+            result = self._sync_with_retries(path, rule, dry_run, quick=from_pending)
         except Exception as err:
-            self._report_error(path, err)
+            self._handle_failure(path, rule, err, dry_run)
             return None
         finally:
             self.status.procesando = None
 
+        was_pending = False if dry_run else self.pending.resolve_after_success(rule.prefijo, path)
         self.status.ultimo_resultado, self.status.ultimo_error = result, None
         self.status.hora = datetime.now()
         self.status.changed()
@@ -1036,6 +1280,8 @@ class FileProcessor:
             titulo = "⚠️ CSV sin datos"
         elif result.simulacion:
             titulo = f"🔎 Simulación: {result.hoja}"
+        elif was_pending and from_pending:
+            titulo = f"✅ {result.hoja} actualizada tras reintentar"
         else:
             titulo = f"✅ {result.hoja} actualizada"
         self.notifier.notify(
@@ -1047,34 +1293,56 @@ class FileProcessor:
         )
         return result
 
-    def _sync_with_retries(self, path: Path, rule: FileRule, dry_run: bool) -> SyncResult:
-        intentos = max(1, self.config.reintentos)
-        espera = 2.0
-        for intento in range(1, intentos + 1):
+    def _sync_with_retries(self, path: Path, rule: FileRule, dry_run: bool, quick: bool = False) -> SyncResult:
+        esperas = () if quick else tuple(self.config.esperas_reintento)
+        relogin_done = False
+        intento = 0
+        while True:
             try:
                 return self.sheets.update_sheet_with_csv(path, rule, dry_run=dry_run)
             except RefreshError as err:
-                # Sesión revocada durante la ejecución: forzar nuevo inicio de sesión.
+                # Sesión revocada: se borra el token y se reintenta una vez (pedirá
+                # iniciar sesión si el monitor es interactivo).
                 self.sheets.reset()
                 try:
                     self.sheets.config.ruta_token.unlink(missing_ok=True)
                 except OSError:
                     pass
-                if intento == intentos:
+                if relogin_done:
                     raise AuthError("La sesión de Google expiró. Vuelve a iniciar sesión.") from err
+                relogin_done = True
+                continue
             except Exception as err:
                 info = describe_error(err)
-                if not info.transitorio or intento == intentos:
+                if not info.transitorio or intento >= len(esperas):
                     raise
-                logger.warning("🔁 Intento %d/%d falló (%s). Reintentando en %.0fs...",
-                               intento, intentos, info.titulo, espera)
-            self.sleep(espera)
-            espera *= 2.5
-        raise RuntimeError("Reintentos agotados")  # pragma: no cover
+                logger.warning("🔁 %s: %s. Reintento %d/%d en %.0fs...",
+                               path.name, info.titulo, intento + 1, len(esperas), esperas[intento])
+                self.sleep(esperas[intento])
+                intento += 1
+
+    def _handle_failure(self, path: Path, rule: FileRule, err: BaseException, dry_run: bool) -> None:
+        info = describe_error(err)
+        if info.transitorio and not dry_run:
+            nuevo = self.pending.set(rule.prefijo, path, info.titulo)
+            logger.warning("⏳ %s queda pendiente (%s). Se reintentará cada %g min.",
+                           path.name, info.titulo, self.config.minutos_reintento_pendientes)
+            log_details(err, logging.DEBUG)
+            self.status.ultimo_error, self.status.hora = info, datetime.now()
+            self.status.changed()
+            if nuevo:
+                self.notifier.notify(
+                    f"⏳ {info.titulo}",
+                    f"{path.name}\nSe reintentará automáticamente cada {self.config.minutos_reintento_pendientes:g} min.",
+                    level="warning", buttons=(NotificationButton("Ver registro", str(LOG_FILE)),), tag="pendiente",
+                )
+            return
+        self._report_error(path, err)
 
     def _report_error(self, path: Path, err: BaseException) -> None:
         info = describe_error(err)
-        logger.error("❌ Fallo al procesar %s\n%s", path.name, format_error_details(err))
+        logger.error("❌ Fallo al procesar %s: %s — %s", path.name, info.titulo, info.mensaje)
+        log_details(err, logging.ERROR)
         self.status.ultimo_error, self.status.hora = info, datetime.now()
         self.status.changed()
         buttons = [NotificationButton("Ver registro", str(LOG_FILE))]
@@ -1111,29 +1379,96 @@ class SyncWorker:
         self._stop.set()
         self._thread.join(timeout)
 
-    def submit(self, path: Path, force: bool = False) -> bool:
+    def submit(self, path: Path, force: bool = False, from_pending: bool = False) -> bool:
         key = str(path).lower()
         with self._lock:
-            if key in self._pending and not force:
+            if key in self._pending and (not force or from_pending):
                 return False
             self._pending.add(key)
-        self.queue.put((path, force))
+        self.queue.put((path, force, from_pending))
         return True
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                path, force = self.queue.get(timeout=0.5)
+                path, force, from_pending = self.queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
-                self.processor.process(path, force=force)
+                self.processor.process(path, force=force, from_pending=from_pending)
             except Exception:  # defensa extra: el hilo nunca debe morir
                 logger.exception("Error inesperado en el procesador")
             finally:
                 with self._lock:
                     self._pending.discard(str(path).lower())
                 self.queue.task_done()
+
+
+class BackgroundJobs:
+    """Tareas periódicas: renovar la sesión antes de que caduque y reintentar pendientes."""
+
+    def __init__(self, config: AppConfig, sheets: GoogleSheetsService, worker: SyncWorker,
+                 pending: PendingStore, notifier: NotifierProtocol):
+        self.config, self.sheets, self.worker = config, sheets, worker
+        self.pending, self.notifier = pending, notifier
+        self._stop = threading.Event()
+        self._threads = [
+            threading.Thread(target=self._token_loop, name="token-keeper", daemon=True),
+            threading.Thread(target=self._pending_loop, name="pending-retry", daemon=True),
+        ]
+
+    def start(self) -> None:
+        for t in self._threads:
+            t.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _token_loop(self) -> None:
+        while not self._stop.wait(60):
+            try:
+                self.sheets.refresh_if_needed()
+            except RefreshError:
+                logger.warning("La sesión de Google fue revocada; se pedirá iniciar sesión en la próxima subida.")
+                self.sheets.reset()
+            except Exception:
+                logger.debug("token-keeper", exc_info=True)
+
+    def _pending_loop(self) -> None:
+        if self._stop.wait(20):  # primer intento poco después de arrancar
+            return
+        while True:
+            try:
+                self.retry_pending()
+            except Exception:
+                logger.exception("Error al reintentar pendientes")
+            if self._stop.wait(self.config.minutos_reintento_pendientes * 60):
+                return
+
+    def retry_pending(self) -> int:
+        """Encola los pendientes; descarta los que ya no existen o son demasiado antiguos."""
+        enviados = 0
+        limite = datetime.now() - timedelta(hours=self.config.horas_max_pendiente)
+        for prefijo, entry in self.pending.items():
+            path = Path(entry.get("archivo", ""))
+            if not path.exists():
+                self.pending.remove(prefijo, only_if=path)
+                logger.info("🗑️ %s ya no existe; se quita de pendientes.", path.name)
+                continue
+            try:
+                desde = datetime.fromisoformat(entry.get("desde", ""))
+            except ValueError:
+                desde = datetime.now()
+            if desde < limite:
+                self.pending.remove(prefijo, only_if=path)
+                logger.error("❌ %s lleva más de %gh sin poder subirse; se descarta.", path.name,
+                             self.config.horas_max_pendiente)
+                self.notifier.notify("❌ No se pudo subir", f"{path.name}\nVuelve a descargarlo o usa 'Reintentar' en la bandeja.",
+                                     level="error", buttons=(NotificationButton("Ver registro", str(LOG_FILE)),))
+                continue
+            if self.worker.submit(path, force=True, from_pending=True):
+                enviados += 1
+        return enviados
 
 
 class CSVDownloadHandler(FileSystemEventHandler):
@@ -1147,7 +1482,8 @@ class CSVDownloadHandler(FileSystemEventHandler):
             raw_path = os.fsdecode(raw_path)
         path = Path(raw_path)
         try:
-            if self.worker.processor.match(path) is not None:
+            processor = self.worker.processor
+            if processor.match(path) is not None and processor.is_new_download(path):
                 self.worker.submit(path)
         except ConfigError as err:
             self.worker.processor._report_error(path, err)
@@ -1240,7 +1576,8 @@ def open_path(target: str) -> None:
 class TrayApp:
     """Icono en la bandeja del sistema con estado y accesos rápidos."""
 
-    def __init__(self, config: AppConfig, worker: SyncWorker, status: SyncStatus, on_quit: Callable[[], None]):
+    def __init__(self, config: AppConfig, worker: SyncWorker, status: SyncStatus, on_quit: Callable[[], None],
+                 jobs: Optional[BackgroundJobs] = None):
         import pystray  # noqa: F401  (lanza ImportError si no está instalado)
         from PIL import Image
 
@@ -1249,11 +1586,14 @@ class TrayApp:
         self.worker = worker
         self.status = status
         self.on_quit = on_quit
+        self.jobs = jobs
+        self.pending = worker.processor.pending
         base = Image.open(ICON_FILE).convert("RGBA") if ICON_FILE.exists() else Image.new("RGBA", (64, 64), (15, 157, 88, 255))
         self.images = {
             "ok": base,
             "error": self._badge(base, (219, 68, 55, 255)),
             "busy": self._badge(base, (251, 188, 5, 255)),
+            "pending": self._badge(base, (255, 138, 0, 255)),
             "paused": self._badge(base, (128, 128, 128, 255)),
         }
         self.icon = pystray.Icon("SheetsAutoSync", base, APP_NAME, menu=self._menu())
@@ -1275,7 +1615,10 @@ class TrayApp:
         if s.pausado:
             return f"{APP_NAME} — en pausa"
         if s.procesando:
-            return f"{APP_NAME} — subiendo {s.procesando}"
+            return _truncate(f"{APP_NAME} — subiendo {s.procesando}", 120)
+        n = len(self.pending)
+        if n:
+            return f"{APP_NAME} — {n} pendiente(s) por reintentar"
         if s.ultimo_error and s.hora:
             return _truncate(f"{APP_NAME} — error {s.hora:%H:%M}: {s.ultimo_error.titulo}", 120)
         if s.ultimo_resultado and s.hora:
@@ -1290,6 +1633,8 @@ class TrayApp:
             menu.SEPARATOR,
             item("Abrir última hoja", lambda: open_path(s.ultimo_resultado.url),
                  enabled=lambda _: bool(s.ultimo_resultado), default=True),
+            item(lambda _: f"Reintentar pendientes ({len(self.pending)})", self._retry_pending,
+                 enabled=lambda _: self.jobs is not None and len(self.pending) > 0),
             item("Reintentar último archivo", self._retry,
                  enabled=lambda _: bool(s.ultimo_archivo and s.ultimo_archivo.exists())),
             item("Sincronizar un archivo…", self._pick_file),
@@ -1304,7 +1649,8 @@ class TrayApp:
 
     def refresh(self) -> None:
         s = self.status
-        key = "paused" if s.pausado else "busy" if s.procesando else "error" if s.ultimo_error else "ok"
+        key = ("paused" if s.pausado else "busy" if s.procesando else "pending" if len(self.pending)
+               else "error" if s.ultimo_error else "ok")
         try:
             self.icon.icon = self.images[key]
             self.icon.title = self._tooltip()[:127]
@@ -1315,6 +1661,10 @@ class TrayApp:
     def _retry(self) -> None:
         if self.status.ultimo_archivo:
             self.worker.submit(self.status.ultimo_archivo, force=True)
+
+    def _retry_pending(self) -> None:
+        if self.jobs is not None:
+            logger.info("🔁 Reintento manual de %d pendiente(s).", self.jobs.retry_pending())
 
     def _toggle_pause(self) -> None:
         self.status.pausado = not self.status.pausado
@@ -1380,8 +1730,38 @@ def build_app(config: AppConfig, notifier: NotifierProtocol, interactive: bool =
     return rules, sheets, processor, status
 
 
+def check_host(host: str) -> Tuple[bool, str]:
+    """¿La red deja llegar al servidor real de Google o muestra la página de bloqueo?"""
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError as err:
+        return False, f"no se pudo resolver ({err})"
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=8) as sock, ctx.wrap_socket(sock, server_hostname=host):
+            return True, ip
+    except ssl.SSLCertVerificationError:
+        return False, f"{ip} → certificado no válido (bloqueo del firewall)"
+    except OSError as err:
+        return False, f"{ip} → {err}"
+
+
+def call_with_network_retry(fn: Callable[[], Any], intentos: int = 7, espera: float = 10.0,
+                            sleep: Callable[[float], None] = time.sleep) -> Any:
+    """Para comandos interactivos: reintenta mientras la red bloquee a Google."""
+    for i in range(intentos):
+        try:
+            return fn()
+        except Exception as err:
+            info = describe_error(err)
+            if not info.transitorio or i == intentos - 1:
+                raise
+            print(f"   ⏳ {info.titulo}. Reintentando en {espera:.0f}s ({i + 1}/{intentos - 1})…", flush=True)
+            sleep(espera)
+
+
 def cmd_verify(config: AppConfig) -> int:
-    """Comprueba reglas, sesión de Google y existencia de cada pestaña."""
+    """Comprueba reglas, red, sesión de Google, pestañas y pendientes."""
     ok = True
     print(f"📁 Carpeta vigilada: {config.carpeta_origen} {'✔' if config.carpeta_origen.is_dir() else '✘ NO EXISTE'}")
     ok &= config.carpeta_origen.is_dir()
@@ -1391,12 +1771,20 @@ def cmd_verify(config: AppConfig) -> int:
     except ConfigError as err:
         print(f"📋 rules.yaml ✘ {err}")
         return 1
+    for host in ("oauth2.googleapis.com", "sheets.googleapis.com"):
+        good, detail = check_host(host)
+        print(f"🌐 {host}: {'✔ ' + detail if good else '✘ ' + detail}")
     try:
         sheets = GoogleSheetsService(config, interactive=True)
-        sheets.get_service()
+        call_with_network_retry(sheets.get_service)
         print("🔐 Sesión de Google ✔")
     except Exception as err:
-        print(f"🔐 Sesión de Google ✘ {describe_error(err).titulo}: {describe_error(err).mensaje}")
+        e = describe_error(err)
+        print(f"🔐 Sesión de Google ✘ {e.titulo}: {e.mensaje}")
+        if is_network_block(err):
+            print("   La red sigue bloqueando oauth2.googleapis.com. Inténtalo en unos minutos o pide a TI\n"
+                  "   que lo agregue a la lista de permitidos del filtro Fortinet.")
+        log_details(err, logging.WARNING)
         return 1
     for rule in rules:
         try:
@@ -1406,6 +1794,11 @@ def cmd_verify(config: AppConfig) -> int:
             ok = False
             e = describe_error(err)
             print(f"   ✘ '{rule.prefijo}*' → {e.titulo}: {e.mensaje}")
+    pend = PendingStore(config.ruta_pendientes).items()
+    print(f"⏳ Pendientes: {len(pend)}")
+    for prefijo, entry in pend:
+        print(f"   • {prefijo}: {Path(entry['archivo']).name} (desde {entry.get('desde')}, "
+              f"{entry.get('intentos')} intento(s), {entry.get('motivo')})")
     print("Todo correcto ✔" if ok else "Hay problemas que revisar ✘")
     return 0 if ok else 1
 
@@ -1423,6 +1816,10 @@ def cmd_single_file(config: AppConfig, path: Path, dry_run: bool, notifier: Noti
         print(result.resumen)
         print(result.url)
         return 0
+    rule = processor.match(path)
+    entry = processor.pending.get(rule.prefijo) if rule else None
+    if entry and entry.get("archivo") == str(path):
+        print("⏳ No se pudo subir ahora (problema temporal). Quedó pendiente: el monitor lo reintentará solo.")
     return 1
 
 
@@ -1435,8 +1832,7 @@ def run_monitor(config: AppConfig, use_tray: bool = True) -> int:
         time.sleep(1)  # dar tiempo a mostrar la notificación
         return 0
 
-    observer = None
-    worker = None
+    observer = worker = jobs = None
     try:
         rules, sheets, processor, status = build_app(config, notifier)
         reglas = rules.get()  # valida rules.yaml al arrancar
@@ -1444,14 +1840,17 @@ def run_monitor(config: AppConfig, use_tray: bool = True) -> int:
             raise ConfigError(f"La carpeta a vigilar no existe: {config.carpeta_origen}")
 
         # Verifica la sesión al arrancar (si hace falta login, se pide ahora y no
-        # en medio de una descarga). Sin internet no bloquea: se reintenta luego.
+        # en medio de una descarga). Sin red no bloquea: se reintenta en segundo plano.
         try:
             sheets.get_service()
         except (TransportError, OSError) as err:
-            logger.warning("Sin conexión al iniciar (%s). Se reintentará al detectar un archivo.", err)
+            logger.warning("Sin acceso a Google al iniciar (%s). Se reintentará en segundo plano.",
+                           describe_error(err).titulo)
 
         worker = SyncWorker(processor)
         worker.start()
+        jobs = BackgroundJobs(config, sheets, worker, processor.pending, notifier)
+        jobs.start()
         observer = Observer()
         observer.schedule(CSVDownloadHandler(worker), str(config.carpeta_origen), recursive=False)
         observer.start()
@@ -1459,9 +1858,11 @@ def run_monitor(config: AppConfig, use_tray: bool = True) -> int:
         logger.info("🚀 Monitor activo. Carpeta: %s", config.carpeta_origen)
         for regla in reglas:
             logger.info("   • '%s*' → hoja '%s' (%s)", regla.prefijo, regla.nombre_hoja, regla.spreadsheet_id)
+        n_pend = len(processor.pending)
         notifier.notify(
             "Auto-Sync activo",
-            f"Vigilando Descargas · {len(reglas)} regla(s): " + ", ".join(r.prefijo for r in reglas),
+            f"Vigilando Descargas · {len(reglas)} regla(s): " + ", ".join(r.prefijo for r in reglas)
+            + (f" · {n_pend} pendiente(s)" if n_pend else ""),
             level="silent",
             buttons=(NotificationButton("Ver registro", str(LOG_FILE)),),
             tag="startup",
@@ -1471,7 +1872,7 @@ def run_monitor(config: AppConfig, use_tray: bool = True) -> int:
         tray = None
         if use_tray:
             try:
-                tray = TrayApp(config, worker, status, on_quit=stop.set)
+                tray = TrayApp(config, worker, status, on_quit=stop.set, jobs=jobs)
             except ImportError:
                 logger.info("pystray no instalado: se ejecuta sin icono en la bandeja.")
             except Exception:
@@ -1490,7 +1891,8 @@ def run_monitor(config: AppConfig, use_tray: bool = True) -> int:
         return 0
     except Exception as err:
         info = describe_error(err)
-        logger.critical("❌ No se pudo iniciar el monitor.\n%s", format_error_details(err))
+        logger.critical("❌ No se pudo iniciar el monitor: %s — %s", info.titulo, info.mensaje)
+        log_details(err, logging.CRITICAL)
         notifier.notify(f"❌ Auto-Sync no pudo iniciar: {info.titulo}", info.mensaje, level="error",
                         buttons=(NotificationButton("Ver registro", str(LOG_FILE)),
                                  NotificationButton("Editar reglas", str(config.ruta_rules))))
@@ -1500,6 +1902,8 @@ def run_monitor(config: AppConfig, use_tray: bool = True) -> int:
         if observer is not None:
             observer.stop()
             observer.join(5)
+        if jobs is not None:
+            jobs.stop()
         if worker is not None:
             worker.stop()
         instance.release()
@@ -1525,6 +1929,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_verify(config)
     if args.archivo:
         notifier = SafeNotifier(build_default_notifier().backends, asynchronous=False)
+        config = dataclasses.replace(config, esperas_reintento=(5.0, 15.0, 30.0))  # manual: esperas más cortas
         return cmd_single_file(config, args.archivo.expanduser().resolve(), args.simulacion, notifier)
     return run_monitor(config, use_tray=not args.sin_bandeja)
 

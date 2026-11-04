@@ -107,6 +107,7 @@ def config(workdir):
         segundos_estabilidad=0.05,
         segundos_espera_maxima=3,
         reintentos=3,
+        esperas_reintento=(0.01, 0.01),
         filas_por_lote=2,
     )
 
@@ -498,12 +499,14 @@ class TestProcessor:
         assert api.kinds().count("get") == 1  # sin reintentos inútiles
         assert processor.status.ultimo_error.titulo == "Sin permiso sobre la hoja"
 
-    def test_retries_exhausted(self, processor, config, api):
+    def test_retries_exhausted_goes_to_pending(self, processor, config, api):
         api.errors = [http_error(500)] * 5
         p = write_csv(config.carpeta_origen / "Enrolled.csv", "a\n1\n")
         assert processor.process(p) is None
         assert api.kinds().count("get") == 3
-        assert "no responde" in processor.notifier.items[-1].title
+        n = processor.notifier.items[-1]
+        assert n.level == "warning" and "no responde" in n.title and "reintentará" in n.message
+        assert processor.pending.get("Enrolled")["archivo"] == str(p)
 
     def test_refresh_error_during_run_resets_session(self, processor, config, api):
         config.ruta_token.write_text("{}", encoding="utf-8")
@@ -585,7 +588,7 @@ def test_worker_survives_unexpected_exceptions(config):
         def __init__(self):
             self.n = 0
 
-        def process(self, path, force=False):
+        def process(self, path, force=False, **kw):
             self.n += 1
             if self.n == 1:
                 raise RuntimeError("inesperado")

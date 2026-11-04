@@ -101,6 +101,25 @@ python -m pytest -q
 
 Las pruebas no usan internet ni modifican tus hojas: la API de Google se simula. Cubren reglas, lectura de CSV (BOM, emojis, cp1252, `;`, celdas con saltos de línea), subida por lotes, ampliación de la cuadrícula, reintentos, sesión caducada, notificaciones, instancia única y una descarga simulada de Chrome de principio a fin.
 
+## 🛡️ Qué archivos se suben (y cuáles nunca)
+
+* Solo se suben **descargas nuevas**: archivos creados o modificados después de arrancar el monitor. Los CSV que ya estaban en Descargas no se suben solos, aunque Windows (antivirus, indexador, vista previa) los lea.
+* Un mismo contenido **nunca se sube dos veces**: se compara una huella del archivo, no la fecha.
+* **Nunca se sube un CSV más antiguo** que otro de la misma regla presente en la carpeta. Como cada CSV reemplaza la hoja entera, uno viejo no puede pisar datos nuevos.
+* Para subir a propósito un archivo antiguo: usa `--archivo RUTA` o, en la bandeja, **Sincronizar un archivo…**.
+
+## 🌐 Red bloqueada (Fortinet) y archivos pendientes
+
+El firewall de la red (**Fortinet / FortiGuard Secure DNS**) bloquea a ratos `oauth2.googleapis.com`. Es el servicio que renueva la sesión de Google cada hora. El error que aparece es `CERTIFICATE_VERIFY_FAILED`. El monitor:
+
+* **renueva la sesión por adelantado**, en cuanto la red lo permite, para no depender de ese servicio justo al llegar un CSV;
+* si aun así falla, reintenta varias veces;
+* después deja el archivo en `logs/pendientes.json` (uno por regla, el más reciente) y lo reintenta solo cada 3 minutos, también tras reiniciar;
+* avisa una sola vez, y otra cuando por fin se sube;
+* nunca desactiva la verificación SSL.
+
+La solución definitiva es pedir a TI que agregue `oauth2.googleapis.com` a la lista de permitidos. `--verificar` muestra si está bloqueado en ese momento.
+
 ## 🩺 Solución de problemas
 
 1. Abre `logs/monitor.log` (o usa **Ver registro** en la notificación o en la bandeja).
