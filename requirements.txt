@@ -4,3 +4,8 @@ google-auth-oauthlib
 plyer
 watchdog
 PyYAML
+# Icono en la bandeja del sistema (opcional pero recomendado)
+pystray
+Pillow
+# Pruebas
+pytest

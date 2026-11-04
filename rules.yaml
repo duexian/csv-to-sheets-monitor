@@ -2,8 +2,10 @@ Enrolled:
   spreadsheet_id: "1b2YgTNVhjoPwowAJU7Hbt15RDNX6yDKiXhIZW5SJwzk"
   nombre_hoja: "Enrolled"
   poner_nota_a1: true
+  incluir_encabezados: false   # la fila 1 de la hoja ya tiene el encabezado
 
 Participantes:
   spreadsheet_id: "1RhZYWkN44tdyK1Zj74ICbTXwhhAEhcHVwL3sW6_nTmg"
-  nombre_hoja: "Participantes"
+  nombre_hoja: "Participantes2026"
   poner_nota_a1: true
+  incluir_encabezados: false   # la fila 1 de la hoja ya tiene el encabezado

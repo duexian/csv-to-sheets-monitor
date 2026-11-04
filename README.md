@@ -1,97 +1,112 @@
-# **🔄 CSV to Sheets Monitor**
+# 🔄 CSV to Sheets Monitor
 
-**CSV to Sheets Monitor** es una herramienta en Python de segundo plano que monitorea en tiempo real la carpeta de **Descargas** (Downloads) del sistema. Cuando detecta que un archivo .csv específico ha sido descargado, procesa sus datos y los sincroniza automáticamente en un libro de **Google Sheets** preconfigurado, enviando una notificación de escritorio al finalizar.
+**CSV to Sheets Monitor** es una herramienta en Python que corre en segundo plano y vigila tu carpeta de **Descargas**. Cuando descargas un `.csv` cuyo nombre empieza por un prefijo configurado (por ejemplo `Enrolled…` o `Participantes…`), sube su contenido a la pestaña correspondiente de **Google Sheets** y te avisa con una notificación de Windows.
 
-## **✨ Características Principales**
+## ✨ Características
 
-> * **Monitoreo en tiempo real:** Detecta de forma instantánea nuevas descargas usando watchdog.  
-> * **Configuración desacoplada (rules.yaml):** Agrega o modifica reglas para tus archivos sin tocar una sola línea de código.  
-> * **Protección de fórmulas:** En lugar de eliminar la pestaña completa, limpia exactamente las columnas utilizadas por el CSV (A..última\_columna), preservando las columnas a la derecha que contengan fórmulas o cálculos.  
-> * **Formato seguro de texto:** Agrega un apóstrofe inicial (') a los datos para evitar que Google Sheets altere números largos, IDs, ceros a la izquierda o formatos de fecha.  
-> * **Registro de auditoría (Notas en A1):** Escribe una nota en la celda A1 indicando la fecha, hora exacta y nombre del archivo utilizado en la última actualización.  
-> * **Notificaciones de escritorio:** Avisos nativos mediante plyer confirmando el éxito de la carga o notificando errores.  
-> * **Multi-usuario y portable:** Detecta dinámicamente la ruta Path.home() del sistema operativo actual.
+* **Monitoreo en tiempo real** con `watchdog`. Detecta descargas de Chrome, Edge y Firefox, y espera a que el archivo termine de escribirse antes de leerlo.
+* **Reglas en `rules.yaml`**: agregas o cambias reglas sin tocar el código. Se recargan solas al guardar el archivo; si tienen un error, se siguen usando las anteriores y recibes un aviso.
+* **Protección de fórmulas**: solo se tocan las columnas que trae el CSV (A..última). Las columnas a la derecha, con tus fórmulas, no se tocan.
+* **La hoja nunca queda vacía**: los datos nuevos se escriben encima de los anteriores y después se limpian las filas que sobran. Si algo falla a mitad de camino, no pierdes la información.
+* **Todo como texto**: se usa `RAW`, así que los IDs largos, los ceros a la izquierda y las fechas no se alteran.
+* **Nota de auditoría en A1** con fecha, archivo y tamaño de la última carga.
+* **Notificaciones nativas de Windows 10/11** con botones **Abrir hoja** y **Ver registro**, mensajes de error claros ("Sin permiso sobre la hoja", "Pestaña no encontrada", "Sin conexión"…) y sin avisos repetidos.
+* **Icono en la bandeja del sistema** (opcional) que cambia de color según el estado. Desde su menú puedes abrir la última hoja, reintentar, sincronizar un archivo a mano, pausar, editar las reglas, ver el registro o salir.
+* **Robusto**:
+  * Reintenta automáticamente ante cortes de internet, errores 5xx o 429 de Google y archivos bloqueados.
+  * Si la sesión de Google caduca, vuelve a abrir el inicio de sesión.
+  * No procesa dos veces el mismo archivo.
+  * No deja ejecutar dos copias a la vez.
+* **Registro persistente** en `logs/monitor.log`, también al ejecutarlo con `pythonw`.
 
-## **📂 Estructura del Repositorio**
+## 📂 Estructura
 
-`csv-to-sheets-monitor/`  
-`├── .gitignore               # Archivo de protección para no subir tokens/credenciales`  
-`├── README.md                # Documentación del proyecto`  
-`├── requirements.txt         # Librerías necesarias de Python`  
-`├── rules.yaml               # Reglas de mapeo (CSV -> Google Sheets)`  
-`└── csv_to_sheets_monitor.py # Script principal de ejecución`
+```
+enrolled/
+├── csv-to-sheets-monitor.py   # Script principal
+├── rules.yaml                 # Reglas prefijo → libro/pestaña
+├── requirements.txt
+├── assets/icon.png            # Icono de notificaciones y bandeja
+├── tests/test_monitor.py      # Pruebas automatizadas (pytest)
+├── logs/                      # Registro (se crea solo, ignorado por git)
+├── credentials.json           # (tuyo, ignorado por git)
+└── token.json                 # (se genera solo, ignorado por git)
+```
 
-## **🛠️ Requisitos e Instalación**
+## 🛠️ Instalación
 
-### **1\. Prerrequisitos**
+```bash
+pip install -r requirements.txt
+```
 
-> * **Python 3.8+** instalado.  
-> * Una cuenta de Google con acceso a **Google Cloud Console**.
+Instálalo con el **mismo Python** que use el acceso directo de inicio (por ejemplo, el `pythonw.exe` global). Sin `pystray`, el monitor funciona igual, solo que sin icono en la bandeja.
 
-### **2\. Clonar e Instalar Dependencias**
+### Credenciales de Google
 
-#### 1. Clona el repositorio
-`git clone https://github.com/duexian/csv-to-sheets-monitor.git`  
-`cd csv-to-sheets-monitor`
+1. En [Google Cloud Console](https://console.cloud.google.com/) habilita **Google Sheets API**.
+2. Crea un **ID de cliente OAuth** de tipo *Aplicación de escritorio* y guárdalo como `credentials.json` junto al script.
+3. La primera vez se abrirá el navegador para iniciar sesión, y se crea `token.json`.
 
-#### 2. (Opcional) Crea y activa un entorno virtual
-`python -m venv venv`  
-##### En Windows:
-`venv\Scripts\activate`  
-##### En Mac/Linux:
-`source venv/bin/activate`
+> 💡 Si tu pantalla de consentimiento OAuth está en modo **"Prueba"**, Google hace caducar la sesión cada 7 días. El monitor te pedirá iniciar sesión de nuevo de forma automática. Para evitarlo, publica la app ("En producción").
 
-#### 3. Instala los paquetes requeridos
-`pip install -r requirements.txt`
+## ⚙️ rules.yaml
 
-## **⚙️ Configuración**
+```yaml
+Enrolled:                       # archivos que empiezan por "Enrolled" (sin distinguir mayúsculas)
+  spreadsheet_id: "ID_O_URL_DEL_LIBRO"   # se puede pegar la URL completa
+  nombre_hoja: "Enrolled"
+  poner_nota_a1: true           # opcional (true por defecto)
+  incluir_encabezados: false    # opcional (true por defecto), ver abajo
 
-### **1\. Credenciales de Google Cloud API**
+Participantes:
+  spreadsheet_id: "OTRO_ID"
+  nombre_hoja: "Participantes2026"
+```
 
-> 1. Ve a [Google Cloud Console](https://console.cloud.google.com/).  
-> 2. Crea un proyecto y habilita la API de **Google Sheets** y **Google Drive**.  
-> 3. Ve a **Pantalla de consentimiento de OAuth** y configúrala como aplicación externa/interna.  
-> 4. En **Credenciales**, crea un **ID de cliente OAuth 2.0** de tipo *Aplicación de escritorio*.  
-> 5. Descarga el archivo JSON generado, renómbralo exactamente a credentials.json y colócalo en la raíz de este proyecto.
+| Campo | Obligatorio | Qué hace |
+|---|---|---|
+| `spreadsheet_id` | Sí | ID del libro (o su URL completa) |
+| `nombre_hoja` | Sí | Pestaña destino (no distingue mayúsculas) |
+| `poner_nota_a1` | No (`true`) | Deja en A1 una nota con fecha, archivo y filas cargadas |
+| `incluir_encabezados` | No (`true`) | `true`: sube el CSV completo desde la fila 1. `false`: omite la primera fila del CSV y escribe los datos **desde la fila 2**, sin tocar el encabezado que ya tiene la hoja (útil si siempre es el mismo o le diste formato) |
 
-**🚨 Seguridad:** El archivo .gitignore incluido evita por defecto que credentials.json y token.json se suban a GitHub. **Nunca compartas tus credenciales.**
+Si dos prefijos coinciden, gana el más largo (el más específico).
 
-### **2\. Archivo de Reglas (rules.yaml)**
+## 🚀 Uso
 
-Define las reglas según el prefijo del nombre de los archivos CSV que descargas. Edita el archivo rules.yaml:  
-#### Si el archivo empieza con "Enrolled" (ej: Enrolled_2026.csv)
-`Enrolled:`  
-`  spreadsheet_id: "TU_GOOGLE_SHEET_ID_AQUÍ"`  
-`  nombre_hoja: "Enrolled"`  
-`  poner_nota_a1: true`
+| Comando | Qué hace |
+|---|---|
+| `python csv-to-sheets-monitor.py` | Inicia el monitor (con icono en la bandeja) |
+| `python csv-to-sheets-monitor.py --verificar` | Revisa las reglas, la sesión de Google y que existan las pestañas |
+| `python csv-to-sheets-monitor.py --archivo "ruta.csv"` | Sube un archivo concreto y termina |
+| `python csv-to-sheets-monitor.py --archivo "ruta.csv" --simulacion` | Muestra lo que haría, **sin escribir** |
+| `--carpeta RUTA` · `--sin-bandeja` · `--debug` | Otra carpeta, sin icono, registro detallado |
 
-#### Si el archivo empieza con "Participantes" (ej: Participantes_Reporte.csv)
-`Participantes:`  
-`  spreadsheet_id: "TU_OTRO_GOOGLE_SHEET_ID_AQUÍ"`  
-`  nombre_hoja: "Participantes"`  
-`  poner_nota_a1: true`
+### Inicio automático con Windows
 
-## **🚀 Uso**
+Crea un `.vbs` en `shell:startup`:
 
-Abre tu terminal en la carpeta del proyecto y ejecuta:  
-`python csv_to_sheets_monitor.py`
+```vb
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "pythonw.exe ""C:\ruta\enrolled\csv-to-sheets-monitor.py""", 0, False
+```
 
-### **¿Cómo probarlo?**
+Al arrancar aparecerá la notificación **"Auto-Sync activo"**.
 
-> 1. Deja corriendo la consola (verás el mensaje 🚀 Servicio de monitoreo activado con éxito).  
-> 2. Descarga un archivo CSV en tu carpeta de **Descargas** de Windows/Mac cuya palabra inicial coincida con las claves configuradas en rules.yaml (ej. Enrolled\_Lunes.csv).  
-> 3. Verás la actividad en la terminal y recibirás una notificación de escritorio confirmando la actualización.
+## 🧪 Pruebas
 
-## **🔄 Ejecución Automática al Iniciar Windows (Opcional)**
+```bash
+python -m pytest -q
+```
 
-Si deseas que el monitor se ejecute automáticamente sin abrir una ventana de consola cada vez que enciendes la PC:
+Las pruebas no usan internet ni modifican tus hojas: la API de Google se simula. Cubren reglas, lectura de CSV (BOM, emojis, cp1252, `;`, celdas con saltos de línea), subida por lotes, ampliación de la cuadrícula, reintentos, sesión caducada, notificaciones, instancia única y una descarga simulada de Chrome de principio a fin.
 
-> 1. Presiona Win \+ R, escribe shell:startup y presiona **Enter**.  
-> 2. Haz un clic derecho en la carpeta que se abre \> **Nuevo** \> **Acceso directo**.  
-> 3. Para ejecutarlo en segundo plano sin ventana de consola, usa pythonw.exe:  
->    `C:\Ruta\A\Tu\pythonw.exe "C:\Ruta\Al\Proyecto\csv_to_sheets_monitor.py"`  
-> 4. Guarda el acceso directo. ¡Listo\!
+## 🩺 Solución de problemas
 
-## **📄 Licencia**
+1. Abre `logs/monitor.log` (o usa **Ver registro** en la notificación o en la bandeja).
+2. Ejecuta `python csv-to-sheets-monitor.py --verificar`.
+3. Si la sesión quedó mal, borra `token.json` y vuelve a iniciar el monitor.
 
-Este proyecto está bajo la Licencia **MIT**. Consulta el archivo LICENSE para más detalles.
+## 📄 Licencia
+
+MIT. Consulta el archivo `LICENSE`.
