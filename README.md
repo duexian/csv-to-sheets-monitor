@@ -108,6 +108,15 @@ Las pruebas no usan internet ni modifican tus hojas: la API de Google se simula.
 * **Nunca se sube un CSV más antiguo** que otro de la misma regla presente en la carpeta. Como cada CSV reemplaza la hoja entera, uno viejo no puede pisar datos nuevos.
 * Para subir a propósito un archivo antiguo: usa `--archivo RUTA` o, en la bandeja, **Sincronizar un archivo…**.
 
+## 📦 Mover a "procesados"
+
+Con `mover_a_procesados: true` (por defecto en cada regla de `rules.yaml`), el CSV se mueve a `Descargas\procesados\Sheets` después de **subirlo con éxito**. Así Descargas queda limpia.
+
+* Si la subida falla, queda pendiente, es una simulación o el CSV no tiene datos, el archivo se queda en Descargas.
+* Si ya existe uno con el mismo nombre en `procesados`, se guarda como `Nombre (2).csv`. Nunca se pisa.
+* Para desactivarlo en una regla: `mover_a_procesados: false`.
+* `logs/ultimas_subidas.json` guarda la fecha del último CSV subido por regla. Gracias a eso, nunca se sube uno más viejo, aunque el más nuevo ya no esté en Descargas.
+
 ## 🌐 Red bloqueada (Fortinet) y archivos pendientes
 
 El firewall de la red (**Fortinet / FortiGuard Secure DNS**) bloquea a ratos `oauth2.googleapis.com`. Es el servicio que renueva la sesión de Google cada hora. El error que aparece es `CERTIFICATE_VERIFY_FAILED`. El monitor:

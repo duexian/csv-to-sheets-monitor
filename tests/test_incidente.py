@@ -71,7 +71,7 @@ def test_incident_reads_of_old_files_never_upload(processor, config, api):
             time.sleep(0.05)
         time.sleep(0.8)
         # …y volver a leerla después tampoco la sube otra vez.
-        simulate_windows_scan(d / "Enrolled Cursos (6).csv")
+        simulate_windows_scan(processor.status.ultimo_archivo)  # ya está en procesados
         time.sleep(1.5)
     finally:
         observer.stop()

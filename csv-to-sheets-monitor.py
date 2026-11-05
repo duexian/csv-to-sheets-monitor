@@ -28,6 +28,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -231,7 +232,7 @@ def format_error_details(err: BaseException) -> str:
 # ==============================================================================
 _SPREADSHEET_URL_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
 _RULE_REQUIRED = {"spreadsheet_id", "nombre_hoja"}
-_RULE_OPTIONAL = {"poner_nota_a1", "incluir_encabezados"}
+_RULE_OPTIONAL = {"poner_nota_a1", "incluir_encabezados", "mover_a_procesados"}
 
 
 @dataclass(frozen=True)
@@ -245,6 +246,8 @@ class FileRule:
     # False: se omite la primera fila del CSV y los datos se escriben desde la
     # fila 2, dejando intacto el encabezado que ya tiene la hoja.
     incluir_encabezados: bool = True
+    # True: tras subirlo con éxito, el CSV se mueve de Descargas a procesados/Sheets.
+    mover_a_procesados: bool = True
 
     @property
     def url(self) -> str:
@@ -290,7 +293,7 @@ def parse_rules(data: Any, origen: str = "rules.yaml") -> List[FileRule]:
             raise ConfigError(f"'{origen}': la regla '{prefijo}' tiene nombre_hoja vacío.")
 
         booleanos = {}
-        for campo in ("poner_nota_a1", "incluir_encabezados"):
+        for campo in ("poner_nota_a1", "incluir_encabezados", "mover_a_procesados"):
             valor = conf.get(campo, True)
             if not isinstance(valor, bool):
                 raise ConfigError(f"'{origen}': en la regla '{prefijo}', {campo} debe ser true o false.")
@@ -406,6 +409,18 @@ class AppConfig:
     # Renovar la sesión cuando falten menos de estos minutos para que caduque.
     minutos_margen_token: float = 15.0
     filas_por_lote: int = 5000
+    # Destino de los CSV ya subidos (relativo a la carpeta vigilada o ruta absoluta).
+    # Se activa/desactiva por regla con 'mover_a_procesados' en rules.yaml.
+    carpeta_procesados: str = "procesados/Sheets"
+
+    @property
+    def ruta_procesados(self) -> Path:
+        p = Path(os.path.expandvars(self.carpeta_procesados)).expanduser()
+        return p if p.is_absolute() else self.carpeta_origen / p
+
+    @property
+    def ruta_ultimas_subidas(self) -> Path:
+        return self.script_dir / "logs" / "ultimas_subidas.json"
 
     @property
     def ruta_pendientes(self) -> Path:
@@ -1000,6 +1015,67 @@ class SyncStatus:
                 logger.debug("Listener de estado falló", exc_info=True)
 
 
+def move_to_processed(path: Path, dest_dir: Path, retries: int = 5, wait: float = 0.5) -> Path:
+    """Mueve el archivo a dest_dir sin pisar otro con el mismo nombre ('x (2).csv')."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / path.name
+    n = 2
+    while target.exists():
+        target = dest_dir / f"{path.stem} ({n}){path.suffix}"
+        n += 1
+    for attempt in range(retries):
+        try:
+            return Path(shutil.move(str(path), str(target)))
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(wait)  # p. ej. Excel o el antivirus lo tienen abierto
+    return target  # pragma: no cover
+
+
+def in_folder(path: Path, folder: Path) -> bool:
+    """True si path está directamente en folder (no en una subcarpeta)."""
+    return os.path.normcase(os.path.abspath(path.parent)) == os.path.normcase(os.path.abspath(folder))
+
+
+class LastSyncStore:
+    """Fecha (mtime) del último CSV subido por regla, en logs/ultimas_subidas.json.
+
+    Protege contra subir un CSV más viejo que el último que ya se subió, aunque
+    ese último ya no esté en Descargas (se movió a 'procesados') o el monitor se
+    haya reiniciado.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def last_mtime(self, prefijo: str) -> Optional[int]:
+        with self._lock:
+            entry = self._load().get(prefijo)
+        return int(entry["mtime_ns"]) if entry and "mtime_ns" in entry else None
+
+    def record(self, prefijo: str, path: Path, mtime_ns: int) -> None:
+        with self._lock:
+            data = self._load()
+            prev = data.get(prefijo)
+            if prev and int(prev.get("mtime_ns", 0)) > mtime_ns:
+                return  # nunca retroceder (p. ej. tras una subida manual de uno viejo)
+            data[prefijo] = {"archivo": path.name, "mtime_ns": mtime_ns,
+                             "subido": datetime.now().isoformat(timespec="seconds")}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)
+
+
 class PendingStore:
     """CSV que no se pudieron subir por un problema temporal (logs/pendientes.json).
 
@@ -1108,6 +1184,7 @@ class FileProcessor:
         self.sheets = sheets
         self.notifier = notifier
         self.pending = pending or PendingStore(config.ruta_pendientes)
+        self.last_sync = LastSyncStore(config.ruta_ultimas_subidas)
         self.status = status or SyncStatus()
         self.sleep = sleep
         self.clock = clock
@@ -1252,8 +1329,18 @@ class FileProcessor:
             # Cada CSV reemplaza la hoja entera: nunca subir uno más antiguo que otro
             # de la misma regla que ya está en la carpeta.
             newer = self.newer_file_for_rule(path, rule)
+            try:
+                mtime_ns = path.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            last = self.last_sync.last_mtime(rule.prefijo)
+            motivo = None
             if newer is not None:
-                logger.info("⏭️ Se omite %s: hay uno más reciente de '%s' (%s).", path.name, rule.prefijo, newer.name)
+                motivo = f"hay uno más reciente en la carpeta ({newer.name})"
+            elif last is not None and mtime_ns < last:
+                motivo = "ya se subió uno más reciente"
+            if motivo:
+                logger.info("⏭️ Se omite %s (regla '%s'): %s.", path.name, rule.prefijo, motivo)
                 if from_pending:
                     self.pending.remove(rule.prefijo, only_if=path)
                 return None
@@ -1272,6 +1359,18 @@ class FileProcessor:
             self.status.procesando = None
 
         was_pending = False if dry_run else self.pending.resolve_after_success(rule.prefijo, path)
+        if not dry_run and not result.vacio:
+            try:
+                self.last_sync.record(rule.prefijo, path, path.stat().st_mtime_ns)
+            except OSError:
+                pass
+        if rule.mover_a_procesados and not dry_run and not result.vacio:
+            try:
+                destino = move_to_processed(path, self.config.ruta_procesados)
+                logger.info("📦 %s movido a %s", path.name, destino.parent)
+                self.status.ultimo_archivo = destino  # "Reintentar último archivo" sigue funcionando
+            except Exception as err:  # no es grave: la hoja ya está actualizada
+                logger.warning("No se pudo mover %s a procesados: %s", path.name, err)
         self.status.ultimo_resultado, self.status.ultimo_error = result, None
         self.status.hora = datetime.now()
         self.status.changed()
@@ -1483,7 +1582,8 @@ class CSVDownloadHandler(FileSystemEventHandler):
         path = Path(raw_path)
         try:
             processor = self.worker.processor
-            if processor.match(path) is not None and processor.is_new_download(path):
+            if (processor.match(path) is not None and in_folder(path, processor.config.carpeta_origen)
+                    and processor.is_new_download(path)):  # ignora lo movido a 'procesados'
                 self.worker.submit(path)
         except ConfigError as err:
             self.worker.processor._report_error(path, err)
@@ -1641,6 +1741,8 @@ class TrayApp:
             item("Pausar monitoreo", self._toggle_pause, checked=lambda _: s.pausado),
             menu.SEPARATOR,
             item("Abrir carpeta Descargas", lambda: open_path(str(self.config.carpeta_origen))),
+            item("Abrir carpeta de procesados", lambda: open_path(str(self.config.ruta_procesados)),
+                 enabled=lambda _: self.config.ruta_procesados.is_dir()),
             item("Editar reglas (rules.yaml)", lambda: open_path(str(self.config.ruta_rules))),
             item("Ver registro", lambda: open_path(str(LOG_FILE))),
             menu.SEPARATOR,

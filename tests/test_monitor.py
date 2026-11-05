@@ -471,7 +471,7 @@ class TestProcessor:
         processor.process(p)
         processor.process(p)
         assert api.kinds().count("get") == 1
-        processor.process(p, force=True)  # "Reintentar" desde la bandeja sí vuelve a subir
+        processor.process(processor.status.ultimo_archivo, force=True)  # "Reintentar" de la bandeja sí
         assert api.kinds().count("get") == 2
 
     def test_modified_file_is_processed_again(self, processor, config, api):

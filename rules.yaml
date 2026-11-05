@@ -3,9 +3,11 @@ Enrolled:
   nombre_hoja: "Enrolled"
   poner_nota_a1: true
   incluir_encabezados: false   # la fila 1 de la hoja ya tiene el encabezado
+  mover_a_procesados: true     # tras subirlo, mover el CSV a Descargas\procesados\Sheets
 
 Participantes:
   spreadsheet_id: "1RhZYWkN44tdyK1Zj74ICbTXwhhAEhcHVwL3sW6_nTmg"
   nombre_hoja: "Participantes2026"
   poner_nota_a1: true
   incluir_encabezados: false   # la fila 1 de la hoja ya tiene el encabezado
+  mover_a_procesados: true     # tras subirlo, mover el CSV a Descargas\procesados\Sheets
